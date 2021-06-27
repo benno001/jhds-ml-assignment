@@ -1,0 +1,205 @@
+---
+title: 'Form over function: can we predict the manner in which people exercise?'
+author: "Ben de Haan"
+date: "6/25/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(AppliedPredictiveModeling)
+library(caret)
+library(dplyr)
+library(tidyr)
+library(randomForest)
+```
+
+## Synopsis
+
+
+### Loading the data and reading in data
+
+Data was downloaded from the URLs specified below and saved to respective comma-separated value files. Further documentation can be found on `http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har`.
+
+Dataset credits: Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+
+
+```{r download}
+urlTrain <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+download.file(urlTrain, destfile = "train.csv")
+urlTest <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+download.file(urlTest, destfile = "test.csv")
+```
+
+```{r read}
+training = read.csv("train.csv")
+testing = read.csv("test.csv")
+```
+
+It's important to not explore the test sets, as that could introduce further bias in creating an algorithm. Let's first get an understanding of what's in the dataset.
+
+```{r amount of variables} 
+length(training)
+```
+
+```{r amount of observations}
+nrow(training)
+```
+
+
+```{r variables in the set}
+training %>%
+  summarise_all(class) %>% 
+    gather
+```
+
+Variables user_name and classe should be factors, so let's fix that.
+
+```{r convert to factor}
+training$classe <- as.factor(training$classe)
+training$user_name <- as.factor(training$user_name)
+
+# As per exception, we should fix this in testing as well to prevent a type mismatch in prediction.
+testing$user_name <- as.factor(testing$user_name)
+```
+
+Let's also see about missing values.
+
+```{r missing values}
+sum_na <- function (x) {
+  sum(is.na(x))
+}
+
+lapply(training,sum_na)
+```
+
+## Methodology
+
+The methodology can be briefly described as follows:
+1. Exploratory data analysis.
+2. Testing various algorithms including an ensemble model.
+3. Choosing the final model based on the test data and evaluating performance on the validation set.
+
+
+## Results
+### Exploratory data analysis
+
+In order to understand the data I have, I start out with exploring what's in there and spotting potential differences.
+
+There are five classes the dataset, corresponding to 'right' or 'wrong' ways to perform an exercise. In total, there are 160 variables telling us something about the user, sensor reading, and classe.
+
+The following piece of code yields the forearm roll for the user Carlitos per classe.
+
+```{r summary statistics per classe for a user, echo=FALSE}
+training %>%
+  filter(user_name=="carlitos") %>%
+    group_by(as.factor(classe)) %>%
+      summarize(min = min(roll_forearm),
+            q1 = quantile(roll_forearm, 0.25),
+            median = median(roll_forearm),
+            mean = mean(roll_forearm),
+            q3 = quantile(roll_forearm, 0.75),
+            max = max(roll_forearm))
+```
+
+To gain some additional insight, we can plot the smoothed arm roll per user per classe over time. This gives us a rough idea of possible trends and differences for this specific measurement.
+
+```{r smoothed arm roll per user per classe, echo=FALSE}
+
+ggplot(training, aes(x=raw_timestamp_part_2, y=roll_arm, color = classe)) + 
+  geom_smooth() + 
+  facet_wrap(.~user_name) + 
+  ggtitle("Smoothed arm roll per user per classe") +
+  xlab("Timestamp") +
+  ylab("Arm roll")
+
+```
+
+```{r summary average summary statistics for a variable over time, echo=FALSE}
+
+ggplot(training, aes(x=raw_timestamp_part_2, y=roll_dumbbell, color = classe)) + 
+  geom_smooth() + 
+  facet_wrap(.~user_name) + 
+  ggtitle("Smoothed dumbbell roll per user per classe") +
+  xlab("Timestamp") +
+  ylab("Arm roll")
+
+```
+
+There seem to be some differences in sensor readings per classe per user. A possibly problematic component for cross-validation is that time-series data is interlinked heavily per user. This means we have to make a choice in tuning the model to a specific user, or making it more general.
+
+Since these devices are most useful in personal recommendations, my approach is to tune a model to a specific user. This means we include the user name variable in learning. 
+
+There are definitely some variables that we should exclude to prevent overfitting or making our model too complex. These include X (the observation number), the cvtd_timestamp, new_window, num_window. The raw_timestamp_part_1 also doesn't look too helpful, as this is not granular to a specific part of the exercise. There are also a lot of missing variables for any of the aggregate statistics, so let's exclude those too.
+
+```{r filter data}
+slim_training <- select(training,
+                        -c(
+                          X,
+                          cvtd_timestamp,
+                          new_window,
+                          num_window,
+                          raw_timestamp_part_1,
+                          starts_with("avg"),
+                          starts_with("max"),
+                          starts_with("min"),
+                          starts_with("stddev"),
+                          starts_with("var"),
+                          starts_with("amplitude"),
+                          starts_with("kurtosis"),
+                          starts_with("skewness")
+                          ))
+```
+
+
+### Testing various algorithms
+
+Since we're trying to predict a class, we should use an algorithm suitable for classification. Decision trees (and especially a random forest) fit this outcome.
+
+Let's not forget to set a seed and generic approach for cross-validation first.
+```{r set parameters}
+set.seed(62656) # hex-encoded "Ben" leaving out the "e" at the end
+cv <- trainControl(method = "cv", number=5)
+```
+
+```{r fit a tree}
+fit <- train(classe~.,
+             data = slim_training, 
+             method = "rpart",
+             trControl = cv)
+print(fit)
+
+```
+
+```{r view decision tree confusion matrics for training set}
+prediction_cart <- predict(fit, training)
+confusionMatrix(training$classe,prediction_cart)
+```
+
+The ordinary classification tree yields an accuracy of ~49.5%.
+
+```{r fit a random forest}
+fit2 <-train(classe~.,
+             data=slim_training,
+             method="rf",
+             trControl=cv,
+             allowParallel=TRUE)
+print(fit2)
+```
+
+```{r view random forest performance on training set}
+prediction_rf <- predict(fit2, training)
+confusionMatrix(training$classe,prediction_rf)
+```
+
+The random forest method yields a near 100% accuracy. This looks like we might be overfitting here, but we don't know the results for sure until we've tried the model on the test set. Let's predict for it first.
+
+```{r predict on test set}
+prediction_rf_test <- predict(fit2, testing)
+prediction_rf_test
+```
+
+## Conclusion
+
+After pre-processing and leaving out some of the variables, the random forest looks like an adequate algorithm for this data, yielding a close to 100% accuracy.
